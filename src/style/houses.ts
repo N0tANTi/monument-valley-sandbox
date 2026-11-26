@@ -1,0 +1,427 @@
+// Houses (Stage 2, Houses owner): every tunable number of the house shell,
+// the roofs, the openings and the windmill, and the seeded "personality" a
+// structure picks once (design section 10, "Organic variation": town →
+// structure → part). Rules and generators both read this file, so a rule
+// that says "a window from the structure's family" and the part that draws
+// it cannot disagree.
+
+import type { Role } from '@/core/vocab';
+import { defineStyle } from '@/core/style';
+import { hash, rand } from '@/core/rand';
+import { DEPTH } from './depth';
+import { PALETTE, RAMPS } from './palette';
+
+export const HOUSE = defineStyle(
+  'house',
+  {
+    /** Crisp Monument Valley walls standing cleanly inside the cell edge. */
+    inset: 0.06,
+    /** Minimal crisp trim reliefs. */
+    proud: 0.022,
+    plinthH: 0.08,
+    trimH: 0.045,
+    /** Zero rustic eaves: clean architectural lines. */
+    eave: 0.01,
+    rake: 0.01,
+    eaveDrop: 0,
+    roofThick: 0.04,
+    rise1: 0.45,
+    rise2: 0.65,
+    rise3: 0.85,
+    leanRise: 0.38,
+    /** Zero ridge sag: Monument Valley ruler-sharp precision. */
+    sag: 0,
+    sagMax: 0,
+    lift: 0,
+    /** Crisp stepped parapet around monument terraces. */
+    parapetH: 0.15,
+    foundationOut: 0.025,
+    capWidth: 0.05,
+    capProud: 0.02,
+    tileTone: 0.02,
+    gableWindow: 0.4,
+  },
+  {
+    inset: [0.03, 0.12, 0.005],
+    eave: [0, 0.12, 0.01],
+    rake: [0, 0.12, 0.01],
+    eaveDrop: [0, 0.1, 0.005],
+    roofThick: [0, 0.1, 0.005],
+    rise1: [0.3, 0.7, 0.01],
+    rise2: [0.4, 1, 0.01],
+    rise3: [0.5, 1.3, 0.01],
+    sag: [0, 0.06, 0.002],
+    lift: [0, 0.1, 0.005],
+  },
+);
+
+export const WINDMILL = defineStyle('windmill', {
+  /** Body radius at the foot and under the cap. */
+  footR: 0.4,
+  neckR: 0.25,
+  /** Sail length from the hub, for a mill one cell tall and for each cell more. */
+  sail: 0.78,
+  sailPerCell: 0.22,
+  sailMax: 1.3,
+});
+
+export type WindowFamily = 'square' | 'tall' | 'arched' | 'shuttered';
+export type DoorLook = 'plank' | 'panel' | 'arched' | 'glazed';
+export type RoofCover = 'shingles' | 'thatch' | 'glass';
+
+/** What a structure decides once about itself. */
+export interface Personality {
+  /** The window family J09 draws from. */
+  family: WindowFamily;
+  /** Index into RAMPS.roof, chosen to stand out against the wall colour. */
+  roof: number;
+  roofColor: string;
+  cover: RoofCover;
+  /** Trim: frames, bands, bargeboards. */
+  trim: string;
+  /** Doors, shutters and other painted wood. */
+  accent: string;
+  /** A second accent for flower boxes and the like. */
+  accent2: string;
+  door: DoorLook;
+  /** A trim band between storeys (some houses are plain). */
+  storeyBands: boolean;
+  /** The gable triangles are half-timbered. */
+  timberGable: boolean;
+  /** Storeys above the ground storey are weatherboarded (painted planks). */
+  plankUpper: boolean;
+  /** −1 … 1: a whole-house bias for small leans and offsets. */
+  lean: number;
+  /**
+   * U12 (edge half): how a rustic house far out from the town is built, or null for a town house.
+   * 'timber' half-timbered walls, 'stone' a rough stone ground storey, 'planks' weatherboard.
+   */
+  rustic: 'timber' | 'stone' | 'planks' | null;
+  /** The chosen house style (1–6), absent for a house that rolled its look (style 0, Random). */
+  style?: number;
+  /** A chosen style's chimney; absent means the rolled brick stack. */
+  chimney?: ChimneyLook;
+}
+
+/** How a styled house's chimney stack is built. */
+export interface ChimneyLook {
+  /** 'brick' red brick, 'stone' grey stone, 'plaster' whitewashed. */
+  stack: 'brick' | 'stone' | 'plaster';
+  pots: 1 | 2;
+}
+
+// ─────────────────────────────────────────────────────────── house styles ──
+//
+// Design section 7, "House style": six named looks the player can choose,
+// plus Random (0), which rolls the look from the seed exactly as before.
+// A style fixes everything but the wall colour. Each has one roof colour
+// (and a stand-in for the wall colours it would clash with), so the six read
+// apart at playing zoom by roof colour first and wall treatment second.
+
+/** Random: the look is rolled from the structure's seed. */
+export const RANDOM_STYLE = 0;
+
+export interface HouseStyle {
+  /** Short name shown in the flyout. */
+  name: string;
+  /**
+   * The style's own wall colour (a palette index, RAMPS.wall): with the Colour
+   * swatch on auto every house of this style is placed in it, so touching
+   * houses of one style join into one building (design section 7).
+   */
+  wall: number;
+  /** One line for the tooltip. */
+  hint: string;
+  /** Roof ramp index, or the cover's own colour when `cover` is not shingles. */
+  roof: number;
+  /** Roof ramp index to use instead, per wall colour that would clash with `roof`. */
+  roofFor?: Partial<Record<number, number>>;
+  cover: RoofCover;
+  family: WindowFamily;
+  door: DoorLook;
+  /** Palette names for painted wood, in preference order: the first that does not clash with the wall wins. */
+  accent: readonly (keyof typeof PALETTE)[];
+  accent2: keyof typeof PALETTE;
+  trim: keyof typeof PALETTE;
+  storeyBands: boolean;
+  timberGable: boolean;
+  plankUpper: boolean;
+  /** Wall treatment (the same three the rustic edge of town uses), or null for plain plaster. */
+  walls: Personality['rustic'];
+  chimney: ChimneyLook;
+}
+
+/** The six styles, numbered 1–6 by their place here (Block.style). Append only: the numbers are saved. */
+export const HOUSE_STYLES: readonly HouseStyle[] = [
+  {
+    name: 'Harbour',
+    wall: 5,
+    hint: 'Blue roof, boarded walls, a glazed door',
+    roof: 1,
+    roofFor: { 4: 4 }, // blue walls: a slate roof
+    cover: 'shingles',
+    family: 'square',
+    door: 'glazed',
+    accent: ['redDark', 'leafDark', 'metal'],
+    accent2: 'white',
+    trim: 'white',
+    storeyBands: false,
+    timberGable: false,
+    plankUpper: true,
+    walls: 'planks',
+    chimney: { stack: 'plaster', pots: 1 },
+  },
+  {
+    name: 'Thatch',
+    wall: 2,
+    hint: 'A straw roof and green shutters',
+    roof: 0,
+    cover: 'thatch',
+    family: 'shuttered',
+    door: 'plank',
+    accent: ['leafDark', 'wood', 'redDark'],
+    accent2: 'pink',
+    trim: 'white',
+    storeyBands: false,
+    timberGable: false,
+    plankUpper: false,
+    walls: null,
+    chimney: { stack: 'stone', pots: 1 },
+  },
+  {
+    name: 'Tudor',
+    wall: 6,
+    hint: 'Red tiles over half-timbered walls',
+    roof: 0,
+    cover: 'shingles',
+    family: 'square',
+    door: 'arched',
+    accent: ['wood', 'redDark', 'metal'],
+    accent2: 'red',
+    trim: 'white',
+    storeyBands: false,
+    timberGable: true,
+    plankUpper: false,
+    walls: 'timber',
+    chimney: { stack: 'brick', pots: 2 },
+  },
+  {
+    name: 'Manor',
+    wall: 0,
+    hint: 'Slate roof, tall windows, bands between the storeys',
+    roof: 4,
+    roofFor: { 1: 0 }, // lilac walls: a red roof (blue would read as Harbour)
+    cover: 'shingles',
+    family: 'tall',
+    door: 'panel',
+    accent: ['metal', 'glass', 'redDark'],
+    accent2: 'white',
+    trim: 'white',
+    storeyBands: true,
+    timberGable: false,
+    plankUpper: false,
+    walls: null,
+    chimney: { stack: 'stone', pots: 2 },
+  },
+  {
+    name: 'Farm',
+    wall: 4,
+    hint: 'Green roof, timbered gables, boarded upper storeys',
+    roof: 3,
+    roofFor: { 3: 0, 7: 0 }, // mint and lime walls: a red roof
+    cover: 'shingles',
+    family: 'shuttered',
+    door: 'plank',
+    accent: ['wood', 'redDark', 'leafDark'],
+    accent2: 'yellow',
+    trim: 'white',
+    storeyBands: false,
+    timberGable: true,
+    plankUpper: true,
+    walls: null,
+    chimney: { stack: 'brick', pots: 1 },
+  },
+  {
+    name: 'Villa',
+    wall: 3,
+    hint: 'Orange tiles and round-topped windows',
+    roof: 2,
+    roofFor: { 0: 0, 6: 0 }, // yellow and peach walls: a red roof
+    cover: 'shingles',
+    family: 'arched',
+    door: 'arched',
+    accent: ['glass', 'leafDark', 'wood'],
+    accent2: 'pink',
+    trim: 'white',
+    storeyBands: true,
+    timberGable: false,
+    plankUpper: false,
+    walls: null,
+    chimney: { stack: 'plaster', pots: 2 },
+  },
+];
+
+/** A valid Block.style value: 0 (Random) or 1–HOUSE_STYLES.length. */
+export function isHouseStyle(n: unknown): n is number {
+  return typeof n === 'number' && Number.isInteger(n) && n >= 0 && n <= HOUSE_STYLES.length;
+}
+
+/** The style a number names, or null for Random (and anything unknown). */
+export function houseStyle(n: number | undefined): HouseStyle | null {
+  return n !== undefined && n >= 1 ? (HOUSE_STYLES[n - 1] ?? null) : null;
+}
+
+/** The roof ramp index a style uses on a wall colour. */
+export function styleRoof(style: HouseStyle, color: number): number {
+  const c = ((color % 8) + 8) % 8;
+  return style.roofFor?.[c] ?? style.roof;
+}
+
+/** The painted-wood colour a style uses on a wall colour. */
+export function styleAccent(style: HouseStyle, color: number): string {
+  const c = ((color % 8) + 8) % 8;
+  const name = style.accent.find((a) => !ACCENT_CLASH[c]!.includes(a)) ?? style.accent[0]!;
+  return PALETTE[name];
+}
+
+/** Roof ramp indices that sit badly on each wall ramp index (too close in hue or value). */
+const ROOF_CLASH: readonly (readonly number[])[] = [
+  [2], //       yellow walls: not the orange roof
+  [4], //       lilac: not the slate roof
+  [], //        pink
+  [3], //       mint: not the green roof
+  [1], //       blue: not the blue roof
+  [], //        cream
+  [2], //       peach: not the orange roof
+  [3], //       lime: not the green roof
+];
+/** Painted-wood accents (doors, shutters). Value and hue both differ from every wall pastel. */
+const ACCENTS = ['redDark', 'glass', 'leafDark', 'wood', 'metal'] as const;
+const ACCENT_CLASH: readonly (readonly string[])[] = [[], ['glass'], ['redDark'], ['leafDark'], ['glass'], [], ['wood'], ['leafDark']];
+
+/**
+ * A structure's personality, from its seed, wall colour, role and size in
+ * cells (only small cottages are thatched). Pure: the same structure always
+ * gets the same answers.
+ *
+ * `style` is the structure's house style (Block.style of its lowest-seq
+ * block): 0 rolls the look from the seed exactly as before styles existed;
+ * 1–6 give that style's look, except the parts a role dictates (a chapel's
+ * windows, door and roof, a keeper's cottage's colours, a greenhouse's glass,
+ * a town hall's front) and the seeded lean.
+ */
+export function personalityOf(seed: number, color: number, role?: Role, size = 1, rustic = false, style = RANDOM_STYLE): Personality {
+  const chosen = houseStyle(style);
+  if (chosen) return styledPersonality(chosen, style, seed, color, role);
+  return rolledPersonality(seed, color, role, size, rustic);
+}
+
+/** The look a chosen style gives, with the role's say where it has one. */
+function styledPersonality(st: HouseStyle, style: number, seed: number, color: number, role?: Role): Personality {
+  const c = ((color % 8) + 8) % 8;
+  let roof = styleRoof(st, c);
+  let cover = st.cover;
+  let family = st.family;
+  let door = st.door;
+  let accent = styleAccent(st, c);
+  let trim: string = PALETTE[st.trim];
+  let storeyBands = st.storeyBands;
+  let timberGable = st.timberGable;
+  let plankUpper = st.plankUpper;
+  if (role === 'chapel') {
+    family = 'arched';
+    door = 'arched';
+    roof = c === 4 ? 4 : 1;
+    cover = 'shingles';
+    accent = PALETTE.wood;
+    timberGable = false;
+    plankUpper = false;
+  } else if (role === 'stilt-house') {
+    family = 'square';
+    door = 'plank';
+    timberGable = false;
+  } else if (role === 'greenhouse') {
+    cover = 'glass';
+    door = 'glazed';
+  } else if (role === 'boathouse') {
+    family = 'square';
+  } else if (role === 'keepers-cottage') {
+    roof = 0;
+    cover = 'shingles';
+    accent = PALETTE.redDark;
+    trim = PALETTE.red;
+  } else if (role === 'town-hall') {
+    family = 'tall';
+    door = 'panel';
+    storeyBands = true;
+  }
+  return {
+    family: role === 'town-hall' ? 'tall' : 'arched',
+    roof,
+    roofColor: cover === 'glass' ? PALETTE.glass : RAMPS.roof[roof]!,
+    cover: cover === 'glass' ? 'glass' : 'shingles',
+    trim: PALETTE.white,
+    accent,
+    accent2: PALETTE[st.accent2],
+    door: 'arched',
+    storeyBands: true,
+    timberGable: false,
+    plankUpper: false,
+    lean: 0,
+    rustic: null,
+    style,
+    chimney: st.chimney,
+  };
+}
+
+/** Random (style 0): Monument Valley geometric personality (clean plaster, arched openings, zero lean). */
+function rolledPersonality(seed: number, color: number, role?: Role, _size = 1, _rustic = false): Personality {
+  const r = (...p: (number | string)[]): number => rand(seed, 'persona', ...p);
+  const c = ((color % 8) + 8) % 8;
+  const roofs = RAMPS.roof.map((_, i) => i).filter((i) => !ROOF_CLASH[c]!.includes(i));
+  let roof = roofs[Math.floor(r('roof') * roofs.length)]!;
+  const accents = ACCENTS.filter((a) => !ACCENT_CLASH[c]!.includes(a));
+  let accent: string = PALETTE[accents[Math.floor(r('accent') * accents.length)]!];
+  const families: WindowFamily[] = ['arched', 'arched', 'tall', 'arched', 'square'];
+  let family = families[Math.floor(r('family') * families.length)]!;
+  const door: DoorLook = 'arched';
+  let cover: RoofCover = 'shingles';
+  let trim: string = PALETTE.white;
+  if (role === 'chapel') {
+    family = 'arched';
+    roof = c === 4 ? 4 : 0;
+    accent = PALETTE.metal;
+  } else if (role === 'greenhouse') {
+    cover = 'glass';
+  } else if (role === 'manor') {
+    family = 'arched';
+  } else if (role === 'keepers-cottage') {
+    roof = 1;
+    accent = PALETTE.redDark;
+    trim = PALETTE.white;
+  } else if (role === 'town-hall') {
+    family = 'tall';
+  }
+  const accent2 = [PALETTE.yellow, PALETTE.pink, PALETTE.red, PALETTE.white][hash(seed, 'accent2') % 4]!;
+  return {
+    family,
+    roof,
+    roofColor: cover === 'glass' ? PALETTE.glass : RAMPS.roof[roof]!,
+    cover,
+    trim,
+    accent,
+    accent2,
+    door,
+    storeyBands: r('bands') < 0.78,
+    timberGable: false,
+    plankUpper: false,
+    lean: 0,
+    rustic: null,
+  };
+}
+
+/** Mixes two '#rrggbb' colours (t = 0 gives a, 1 gives b). For trims derived from palette colours. */
+export function mixColor(a: string, b: string, t: number): [number, number, number] {
+  const p = (s: string, i: number): number => Number.parseInt(s.slice(1 + i * 2, 3 + i * 2), 16);
+  return [0, 1, 2].map((i) => Math.round(p(a, i) + (p(b, i) - p(a, i)) * t)) as [number, number, number];
+}

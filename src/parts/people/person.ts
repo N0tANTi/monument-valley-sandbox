@@ -1,0 +1,268 @@
+// The little person (People, Stage 3): the spike's person() redrawn with
+// MeshBuilder in the game's style. Pure.
+//
+// A person is five rigid pieces, each built round its own pivot, so the
+// crowd can pose them with matrices instead of redrawing them:
+//
+//   body   torso, head, hair and hat. Origin at the feet, +Y up, facing +Z.
+//   legL   legR   origin at the hip, hanging down −Y. L is on −X.
+//   armL   armR   origin at the shoulder, hanging down −Y.
+//
+// They are tiny on screen (0.42 tall: about 23 pixels at playing zoom), so
+// the drawing is all silhouette and flat colour: a big round head, a bean of
+// a body, no face. Everything below the neck is ONE ink group and the head
+// with its hair and hat is another, so the pen draws a person as two shapes
+// and never as a knot of small outlines.
+
+import { rand } from '@/core/rand';
+import { compose, rotationX, scaling, translation, type Mat4Like } from '@/core/mat4';
+import { MeshBuilder, PATTERN, type MeshData } from '@/gen/mesh';
+import { smoothBall, smoothLathe, soft } from '@/gen/soft';
+import { PALETTE } from '@/style/palette';
+import { PERSON } from '@/style/people';
+
+export type HairStyle = 'short' | 'bob' | 'bun' | 'long' | 'bald';
+export type HatStyle = 'none' | 'straw' | 'cap' | 'bobble' | 'helmet';
+
+export interface Look {
+  skin: string;
+  hair: string;
+  top: string;
+  bottom: string;
+  hairStyle: HairStyle;
+  hat: HatStyle;
+  hatColor: string;
+  /** A skirt or a long coat: the body flares to the knee and the legs show bare below it. */
+  dress: boolean;
+  child: boolean;
+  /** Whole-figure scale: figure units to world units. PERSON.height ÷ DESIGN_HEIGHT for an average adult, PERSON.child of that for a child. */
+  scale: number;
+  /** Width of the body, about 1. */
+  girth: number;
+}
+
+const pickOf = <T>(items: readonly T[], r: number): T => items[Math.min(items.length - 1, Math.floor(r * items.length))]!;
+
+/** A resident's seeded look (L21): skin, hair, clothes and hat from the people palette. */
+export function lookOf(seed: number, child = false): Look {
+  const r = (...p: (number | string)[]): number => rand(seed, 'look', ...p);
+  const top = pickOf(PERSON.tops, r('top'));
+  // Trousers that are not the colour of the shirt.
+  let bottom = pickOf(PERSON.bottoms, r('bottom'));
+  if (bottom === top) bottom = PERSON.bottoms[0]!;
+  const hairRoll = r('hair-style');
+  const hairStyle: HairStyle = hairRoll < 0.36 ? 'short' : hairRoll < 0.6 ? 'bob' : hairRoll < 0.76 ? 'bun' : hairRoll < 0.94 ? 'long' : 'bald';
+  const hatRoll = r('hat');
+  // Monument Valley Ida / Silent Pilgrim style: most figures wear iconic tall conical hats & flaring cloaks.
+  const hat: HatStyle = hatRoll < 0.72 ? 'straw' : hatRoll < 0.88 ? 'bobble' : 'none';
+  return {
+    skin: pickOf(PERSON.skin, r('skin')),
+    hair: pickOf(PERSON.hair, r('hair')),
+    top,
+    bottom,
+    hairStyle,
+    hat,
+    hatColor: top === '#fdfbf7' ? '#fdfbf7' : pickOf(PERSON.hats, r('hat-colour')),
+    dress: r('dress') < 0.85,
+    child,
+    scale: (PERSON.height / DESIGN_HEIGHT) * (child ? PERSON.child * (0.92 + r('size') * 0.16) : 0.95 + r('size') * 0.1),
+    girth: 0.92 + r('girth') * 0.18,
+  };
+}
+
+/**
+ * A soldier of a garrison (L36): every one of a troop wears the same tabard in the castle's colour over
+ * dark hose, and the same iron helmet; only the face under it is their own.
+ */
+export function soldierLook(seed: number, tabard: string): Look {
+  const look = lookOf(seed, false);
+  return { ...look, top: tabard, bottom: PALETTE.metal, hat: 'helmet', hatColor: '#8d8e99', dress: false, hairStyle: 'short', girth: 1, scale: PERSON.height / DESIGN_HEIGHT };
+}
+
+/**
+ * The figure is drawn this tall in its own units, whatever PERSON.height says: the style value scales
+ * the whole figure, so its proportions hold.
+ */
+export const DESIGN_HEIGHT = 0.42;
+
+/** Where the pieces join, in the figure's own units (before `scale`). */
+export interface Rig {
+  hipY: number;
+  hipX: number;
+  shoulderY: number;
+  shoulderX: number;
+  headY: number;
+  head: number;
+  leg: number;
+  arm: number;
+}
+
+export function rigOf(look: Look): Rig {
+  const head = PERSON.head * (look.child ? 1.12 : 1);
+  return {
+    hipY: 0.128,
+    hipX: 0.031 * look.girth,
+    shoulderY: 0.25,
+    shoulderX: 0.064 * look.girth,
+    headY: DESIGN_HEIGHT - PERSON.head,
+    head,
+    leg: 0.128,
+    arm: 0.108,
+  };
+}
+
+export interface PersonMeshes {
+  body: MeshData;
+  legL: MeshData;
+  legR: MeshData;
+  armL: MeshData;
+  armR: MeshData;
+}
+
+/** Points of a ball's profile for `lathe`, from polar angle a0 (0 = top) to a1, bottom to top. */
+function arc(radius: number, cy: number, a0: number, a1: number, steps: number): [number, number][] {
+  const out: [number, number][] = [];
+  for (let i = steps; i >= 0; i--) {
+    const a = a0 + ((a1 - a0) * i) / steps;
+    out.push([Math.max(0, radius * Math.sin(a)), cy + radius * Math.cos(a)]);
+  }
+  return out;
+}
+
+const SHOE = PALETTE.metal;
+
+function leg(b: MeshBuilder, look: Look, rig: Rig): void {
+  const w = 0.044 * look.girth, d = 0.05, len = rig.leg;
+  b.setInk('body').setPattern(PATTERN.none);
+  b.setColor(look.dress ? look.skin : look.bottom);
+  b.box([-w / 2, -len + 0.03, -d / 2], [w / 2, 0, d / 2], { skip: ['top', 'bottom'] });
+  // The shoe sticks out in front: at this size it is the one thing that says which way the feet point.
+  b.setColor(SHOE);
+  b.box([-w / 2 - 0.002, -len, -d / 2 - 0.002], [w / 2 + 0.002, -len + 0.03, d / 2 + 0.026]);
+}
+
+function arm(b: MeshBuilder, look: Look, rig: Rig): void {
+  const w = 0.03, d = 0.036, len = rig.arm, hand = 0.03;
+  b.setInk('body').setPattern(PATTERN.none);
+  b.setColor(look.top);
+  b.box([-w / 2, -len + hand, -d / 2], [w / 2, 0.012, d / 2], { skip: ['bottom'] });
+  b.setColor(look.skin);
+  // The hand: a little round mitten out of the sleeve (a box's corners read as a block close up).
+  b.box([-w / 2, -len + hand * 0.55, -d / 2], [w / 2, -len + hand, d / 2], { skip: ['top', 'bottom'] });
+  smoothBall(b, 0, -len + hand * 0.45, 0, w * 0.62, hand * 0.5, d * 0.55, 5, 3);
+}
+
+function body(b: MeshBuilder, look: Look, rig: Rig): void {
+  const g = look.girth;
+  const segs = 10;
+  b.setInk('body').setPattern(PATTERN.none);
+  // The torso: a bean, a little flatter front to back than side to side; smooth along its profile as
+  // well as round it, so it shades in soft bands instead of rings.
+  b.at(scaling(g, 1, 0.8), () => {
+    if (look.dress) {
+      b.setColor(look.top);
+      smoothLathe(b, [[0, 0.062], [0.082, 0.066], [0.074, 0.12], [0.056, 0.2], [0.05, 0.25], [0.03, 0.283], [0, 0.29]], { segments: segs, crease: 1.2 });
+    } else {
+      b.setColor(look.bottom);
+      smoothLathe(b, [[0, 0.098], [0.05, 0.102], [0.058, 0.152]], { segments: segs, crease: 1.2 });
+      b.setColor(look.top);
+      smoothLathe(b, [[0.058, 0.152], [0.057, 0.21], [0.05, 0.25], [0.03, 0.283], [0, 0.29]], { segments: segs, crease: 1.2 });
+    }
+  });
+  // The head and its hair: one soft body (src/gen/soft.ts), so the pen draws the round of the head
+  // and nothing across the face or where the hair lies on it; the hair is its colour, not a line.
+  const r = rig.head, cy = rig.headY;
+  const hs = HEAD_SEGMENTS;
+  const hr = r * 1.08;
+  soft(b, { ink: 'head' }, (s) => {
+    const tilt = (rad: number, fn: () => void): void => {
+      s.at(compose(translation(0, cy, 0), rotationX(-rad), translation(0, -cy, 0)), fn);
+    };
+    s.b.setColor(look.skin);
+    s.ball(0, cy, 0, r, r, r, hs, 6);
+    s.b.setColor(look.hair);
+    switch (look.hairStyle) {
+      case 'short':
+        tilt(0.42, () => s.b.lathe(arc(hr, cy, 0, 1.55, 4), { segments: hs }));
+        break;
+      case 'bob':
+        tilt(0.62, () => s.b.lathe(arc(hr * 1.03, cy, 0, 1.95, 5), { segments: hs }));
+        break;
+      case 'bun':
+        tilt(0.42, () => s.b.lathe(arc(hr, cy, 0, 1.55, 4), { segments: hs }));
+        s.ball(0, cy + r * 0.86, -r * 0.62, r * 0.42, r * 0.42, r * 0.42, 8, 5);
+        break;
+      case 'long':
+        tilt(0.5, () => s.b.lathe(arc(hr, cy, 0, 1.7, 4), { segments: hs }));
+        // Down the back to the shoulders: the back half of a sleeve, shaded as one with the head.
+        s.hold(0, cy - r * 0.55, -r * 0.1, hr, r * 1.45, hr);
+        s.b.lathe([[hr * 0.86, rig.shoulderY - 0.012], [hr * 1.02, cy - r * 0.3], [hr, cy + r * 0.2]], { segments: hs, start: Math.PI + 0.25, sweep: Math.PI - 0.5 });
+        break;
+      case 'bald':
+        break;
+    }
+    // A cap's crown and a woolly hat sit close on the head like hair: part of its round.
+    if (look.hat === 'cap') {
+      s.b.setColor(look.hatColor);
+      tilt(0.16, () => s.b.lathe(arc(hr * 1.06, cy, 0, 1.25, 4), { segments: hs }));
+    } else if (look.hat === 'bobble') {
+      s.b.setColor(look.hatColor);
+      tilt(0.2, () => s.b.lathe([[hr * 1.08, cy + r * 0.28], [hr * 1.02, cy + r * 0.6], [hr * 0.6, cy + r + 0.018], [0, cy + r + 0.03]], { segments: hs }));
+    }
+  });
+  if (look.hat !== 'none') {
+    // Hats that stand off the head keep their own edges: a brim is drawn on purpose.
+    b.setInk('head').setColor(look.hatColor);
+    const top = cy + r;
+    if (look.hat === 'straw') {
+      // Iconic Monument Valley Ida tall crisp conical hat.
+      const y = cy + r * 0.36;
+      smoothLathe(b, [[r * 1.15, y], [r * 0.95, y + r * 0.45], [r * 0.55, y + r * 1.35], [0, y + r * 2.55]], { segments: hs, crease: 0.9 });
+      b.lathe([[0, y], [r * 1.15, y]], { segments: hs });
+    } else if (look.hat === 'cap') {
+      b.box([-r * 0.62, cy + r * 0.34, r * 0.5], [r * 0.62, cy + r * 0.46, r * 1.5]);
+    } else if (look.hat === 'helmet') {
+      // L36: a soldier's kettle hat: a round iron crown with a wide brim, and a little spike on top.
+      const y = cy + r * 0.18;
+      smoothLathe(b, [[r * 1.45, y], [r * 1.45, y + 0.01], [r * 1.08, y + 0.014], [r * 1.08, y + r * 0.55], [r * 0.7, top + 0.012], [0, top + 0.02]], { segments: hs, crease: 0.9 });
+      b.lathe([[0, y], [r * 1.45, y]], { segments: hs });
+      b.lathe([[0.008, top + 0.018], [0, top + 0.05]], { segments: 5 });
+    } else if (look.hat === 'bobble') {
+      b.setColor(PALETTE.white);
+      smoothBall(b, 0, top + 0.04, -0.01, r * 0.3, r * 0.3, r * 0.3, 7, 4);
+    }
+  }
+}
+
+/** Round a head: enough sides that its outline reads round close up (fly mode), few enough for a crowd. */
+const HEAD_SEGMENTS = 12;
+
+/**
+ * The five pieces of one person. `ink` namespaces the ink groups: pass the
+ * person's id, so two people standing together get a line between them.
+ */
+export function buildPerson(look: Look, ink: number | string): PersonMeshes {
+  const rig = rigOf(look);
+  const piece = (draw: (b: MeshBuilder) => void): MeshData => {
+    const b = new MeshBuilder({ ink });
+    draw(b);
+    return b.build();
+  };
+  return {
+    body: piece((b) => body(b, look, rig)),
+    legL: piece((b) => leg(b, look, rig)),
+    legR: piece((b) => leg(b, look, rig)),
+    armL: piece((b) => arm(b, look, rig)),
+    armR: piece((b) => arm(b, look, rig)),
+  };
+}
+
+/** The order of the pieces wherever they are listed (rig matrices, handles). */
+export const PIECES = ['body', 'legL', 'legR', 'armL', 'armR'] as const;
+export type Piece = (typeof PIECES)[number];
+
+/** One mesh of a whole person, each piece placed by its matrix (PIECES order): for the static part. */
+export function assemblePerson(meshes: PersonMeshes, matrices: readonly Mat4Like[], into: MeshBuilder): MeshBuilder {
+  PIECES.forEach((p, i) => into.add(meshes[p], matrices[i]));
+  return into;
+}

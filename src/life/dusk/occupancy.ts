@@ -1,0 +1,60 @@
+// Who is home (for L07: windows light only where a resident is home).
+//
+// The People owner calls this as residents come and go; until anyone does,
+// every house counts as occupied, so a town with no people still lights up.
+//
+//   setOccupied(stage, houseStructureId, false);   // everyone is out: its windows go dark
+//   setOccupied(stage, houseStructureId, true);    // someone came home: they light (L25)
+//
+// The window behaviour reads it every drawing; a change fades in over
+// DUSKY.houseFade seconds.
+
+import type { StructureId } from '@/resolve/plan';
+import type { LifeStage } from '../api';
+
+const byStage = new WeakMap<LifeStage, Map<StructureId, boolean>>();
+
+export function setOccupied(stage: LifeStage, house: StructureId, home: boolean): void {
+  let t = byStage.get(stage);
+  if (!t) byStage.set(stage, (t = new Map()));
+  t.set(house, home);
+}
+
+/** True unless someone said the house is empty. */
+export function isOccupied(stage: LifeStage, house: StructureId | undefined): boolean {
+  if (house === undefined) return true;
+  return byStage.get(stage)?.get(house) ?? true;
+}
+
+/** Forget everything (a new town). */
+export function clearOccupancy(stage: LifeStage): void {
+  byStage.delete(stage);
+}
+
+const glows = new WeakMap<LifeStage, Map<StructureId, { level: number; dark: number }>>();
+
+/**
+ * L07: how lit a house's windows are now (0–1), and how many storeys from the ground are dark. The window
+ * behaviour writes it; the door leaves' glass and the silhouettes in windows follow it.
+ */
+export function setHouseGlow(stage: LifeStage, house: StructureId, level: number, dark = 0): void {
+  let t = glows.get(stage);
+  if (!t) glows.set(stage, (t = new Map()));
+  const g = t.get(house);
+  if (g) {
+    g.level = level;
+    g.dark = dark;
+  } else t.set(house, { level, dark });
+}
+
+/** 1 (as the time of day says) unless the window behaviour has said otherwise. */
+export function houseGlowOf(stage: LifeStage, house: StructureId | undefined): number {
+  if (house === undefined) return 1;
+  return glows.get(stage)?.get(house)?.level ?? 1;
+}
+
+/** Storeys from the ground whose windows are dark (downstairs gone to bed). */
+export function houseDarkOf(stage: LifeStage, house: StructureId | undefined): number {
+  if (house === undefined) return 0;
+  return glows.get(stage)?.get(house)?.dark ?? 0;
+}
